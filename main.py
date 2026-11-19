@@ -17,6 +17,13 @@ Outside the grader, MAKEFUN_OUTPUT_DIR stands in for /output:
 
     mkdir -p out && MAKEFUN_OUTPUT_DIR=out python3 main.py
 
+Four modes share the one inspection path (inspect); only the plain run writes:
+
+    python3 main.py                publish the page to <output>/entry.png
+    python3 main.py --check-only   inspect and report, write nothing
+    python3 main.py --summary      one compact JSON line, write nothing
+    python3 main.py --strict       inspect with the 32 KiB floor, write nothing
+
 The run is deterministic: the same input file always produces the same output
 bytes, which is what the harness's two runs are compared on.
 """
@@ -32,12 +39,15 @@ import zlib
 from pathlib import Path
 
 MAX_BYTES = 1_048_576          # the gate: at most 1 MiB
+MIN_BYTES = 32_768             # --strict: below this a news page is unreadable
 MAX_SIDE = 1024                # the gate: at most 1024 by 1024 pixels
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 JPEG_MAGIC = b"\xff\xd8\xff"
 PNG_COLOUR_TYPES = {0, 2, 3, 4, 6}
 JPEG_SOF_MARKERS = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
                     0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+SUMMARY_FIELDS = ("format", "bytes", "width", "height", "sha256")
+KNOWN_FLAGS = ("--check-only", "--summary", "--strict")
 
 
 class EntryError(Exception):
@@ -146,8 +156,12 @@ def jpeg_info(data: bytes) -> tuple[int, int]:
 # ------------------------------------------------------------------ gate
 
 
-def inspect(path: Path) -> dict:
-    """Read the page and prove it passes every check the gate makes on bytes."""
+def inspect(path: Path, *, strict: bool = False) -> dict:
+    """Read the page and prove it passes every check the gate makes on bytes.
+
+    This is the single inspection path: every mode calls it exactly once, and
+    ``strict`` only adds the news-page size floor on top of the gate's limits.
+    """
     try:
         data = path.read_bytes()
     except OSError as err:
@@ -169,6 +183,11 @@ def inspect(path: Path) -> dict:
         raise EntryError(f"the header gives an empty image ({width}x{height})")
     if width > MAX_SIDE or height > MAX_SIDE:
         raise EntryError(f"the image is {width}x{height}, over {MAX_SIDE} by {MAX_SIDE}")
+    if strict and size < MIN_BYTES:
+        raise EntryError(
+            f"{path.name} is {size} bytes, under the {MIN_BYTES}-byte floor "
+            f"({MIN_BYTES // 1024} KiB): too small to read as a news page"
+        )
     return {
         "format": kind,
         "bytes": size,
@@ -179,11 +198,14 @@ def inspect(path: Path) -> dict:
     }
 
 
-def publish(source: Path, target_dir: Path) -> dict:
-    """Copy the page's exact bytes into place; return the run's receipt."""
-    if not source.is_file():
-        raise EntryError(f"{source} is not a regular file")
-    info = inspect(source)
+def receipt(info: dict) -> dict:
+    """The reportable part of a checked page: everything but its raw bytes."""
+    return {key: value for key, value in info.items() if key != "data"}
+
+
+def publish(info: dict, target_dir: Path) -> dict:
+    """Copy the checked page's exact bytes into place; return the run's receipt."""
+    payload = info["data"]
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
     except OSError as err:
@@ -192,7 +214,6 @@ def publish(source: Path, target_dir: Path) -> dict:
         raise EntryError(f"{target_dir} is not a directory")
     target = target_dir / "entry.png"
     tmp = target_dir / ".entry.png.tmp"
-    payload = info.pop("data")
     try:
         tmp.write_bytes(payload)
         os.chmod(tmp, 0o644)
@@ -203,23 +224,40 @@ def publish(source: Path, target_dir: Path) -> dict:
         except OSError:
             pass
         raise EntryError(f"cannot write {target}: {err.strerror or err}") from err
-    info["output"] = str(target)
-    return info
+    return {**receipt(info), "output": str(target)}
+
+
+def parse_flags(argv: list[str]) -> dict:
+    """Turn the command line into the one mode plus the strict-gate switch."""
+    flags = argv[1:]
+    unknown = [flag for flag in flags if flag not in KNOWN_FLAGS]
+    if unknown:
+        raise EntryError(
+            f"unknown option(s) {', '.join(unknown)}; "
+            f"expected one of {', '.join(KNOWN_FLAGS)}"
+        )
+    return {
+        "publish": not flags,               # the bare run is the graded one
+        "summary": "--summary" in flags,
+        "strict": "--strict" in flags,
+    }
 
 
 def main(argv: list[str]) -> int:
-    check_only = "--check-only" in argv[1:]
     source = source_path()
     try:
-        if check_only:
-            info = inspect(source)
-            info.pop("data")
+        flags = parse_flags(argv)
+        info = inspect(source, strict=flags["strict"])
+        if flags["summary"]:
+            report = {key: info[key] for key in SUMMARY_FIELDS}
+        elif flags["publish"]:
+            report = publish(info, output_dir())
         else:
-            info = publish(source, output_dir())
+            report = receipt(info)
     except EntryError as err:
         sys.stderr.write(json.dumps({"done": False, "error": str(err)}) + "\n")
         return 2
-    print(json.dumps({"done": True, **info}, sort_keys=True))
+    print(json.dumps({"done": True, **report}, sort_keys=True))
     return 0
 
 
